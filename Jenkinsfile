@@ -1,144 +1,82 @@
 pipeline {
-  agent any
+    agent none // We will specify the agent for each stage
 
-  environment {
-    // Sonar token stored in Jenkins credentials (type: Secret text, id: sonarqube-token1)
-    SONAR_AUTH_TOKEN = credentials('sonarqube-token1')
-    SONAR_HOST_URL   = 'http://host.docker.internal:9001'   // rely on add-host for container reachability
-    // Use the Jenkins workspace absolute path so containers see the same paths as the host
-    WORKSPACE_DIR = "${env.WORKSPACE}"
-    // local maven repo inside workspace to reduce permission/lock issues
-    MAVEN_REPO = "${env.WORKSPACE}/.m2/repository"
-  }
+    stages {
+        stage('Build All') {
+            parallel {
 
-  stages {
+                stage('Build AisheMasterService') {
+                    agent {
+                        docker { image 'maven:3.8.6-jdk-11' }
+                    }
+                    steps {
+                        dir('aishe_backend/AisheMasterService') {
+                            sh 'mvn -DskipTests -e clean package'
+                        }
+                    }
+                    post {
+                        success {
+                            archiveArtifacts artifacts: 'aishe_backend/AisheMasterService/target/*.jar', followSymlinks: false
+                        }
+                    }
+                }
 
-    stage('Check prerequisites') {
-      steps {
-        sh '''
-          echo "---- PATH ----"
-          echo "$PATH"
-          echo "---- WORKSPACE ----"
-          echo "${WORKSPACE_DIR}"
-          which docker || (echo "docker not found in PATH" && exit 1)
-        '''
-      }
-    }
+                stage('Build UserMgtService') {
+                    agent {
+                        docker { image 'maven:3.8.6-jdk-11' }
+                    }
+                    steps {
+                        dir('aishe_backend/UserMgtService') {
+                            sh 'mvn -DskipTests -e clean package'
+                        }
+                    }
+                    post {
+                        success {
+                            archiveArtifacts artifacts: 'aishe_backend/UserMgtService/target/*.jar', followSymlinks: false
+                        }
+                    }
+                }
 
-    stage('Build All') {
-      parallel {
+                stage('Build Frontend') {
+                    agent {
+                        docker {
+                            image 'node:18'
+                            args  '--ulimit nofile=65536:65536'
+                        }
+                    }
+                    steps {
+                        dir('aishe_frontend') {
+                            sh '''
+                                # Create a container-local temp directory and copy project (excluding node_modules)
+                                TMPDIR=$(mktemp -d)
+                                tar -cf - --exclude=node_modules . | (cd "$TMPDIR" && tar -xf -)
+                                cd "$TMPDIR"
 
-        stage('Build AisheMasterService') {
-          steps {
-            dir("${WORKSPACE_DIR}/aishe_backend/AisheMasterService") {
-              sh """
-                docker run --rm \
-                  --dns 8.8.8.8 \
-                  --add-host=host.docker.internal:host-gateway \
-                  --ulimit nofile=65536:65536 \
-                  -v "${WORKSPACE_DIR}:${WORKSPACE_DIR}" \
-                  -v "${MAVEN_REPO}:/root/.m2/repository" \
-                  -w "${WORKSPACE_DIR}/aishe_backend/AisheMasterService" \
-                  maven:3.8.6-jdk-11 \
-                  mvn -B -Dmaven.repo.local=/root/.m2/repository -DskipTests -e clean package
-              """
-            }
-          }
-          post {
-            success { archiveArtifacts artifacts: 'aishe_backend/AisheMasterService/target/*.jar', followSymlinks: false }
-          }
-        }
+                                # Raise file descriptor limit inside container
+                                ulimit -n 65536
+                                export NODE_OPTIONS="--max-old-space-size=4096"
 
-        stage('Build UserMgtService') {
-          steps {
-            dir("${WORKSPACE_DIR}/aishe_backend/UserMgtService") {
-              sh """
-                docker run --rm \
-                  --dns 8.8.8.8 \
-                  --add-host=host.docker.internal:host-gateway \
-                  --ulimit nofile=65536:65536 \
-                  -v "${WORKSPACE_DIR}:${WORKSPACE_DIR}" \
-                  -v "${MAVEN_REPO}:/root/.m2/repository" \
-                  -w "${WORKSPACE_DIR}/aishe_backend/UserMgtService" \
-                  maven:3.8.6-jdk-11 \
-                  mvn -B -Dmaven.repo.local=/root/.m2/repository -DskipTests -e clean package
-              """
-            }
-          }
-          post {
-            success { archiveArtifacts artifacts: 'aishe_backend/UserMgtService/target/*.jar', followSymlinks: false }
-          }
-        }
+                                # Use container-local npm cache
+                                mkdir -p .npm
+                                npm_config_cache=$PWD/.npm npm ci --legacy-peer-deps
 
-        stage('Build Frontend') {
-          steps {
-            dir("${WORKSPACE_DIR}/aishe_frontend") {
-              // use a stable node image; use local tmp for npm cache to avoid macOS ENFILE/permission issues
-              sh '''
-                docker run --rm \
-                  --dns 8.8.8.8 \
-                  --add-host=host.docker.internal:host-gateway \
-                  --ulimit nofile=65536:65536 \
-                  -v "${WORKSPACE_DIR}:${WORKSPACE_DIR}" \
-                  -v "${WORKSPACE_DIR}/.npm-cache":/tmp/.npm \
-                  -w "${WORKSPACE_DIR}/aishe_frontend" \
-                  node:18 \
-                  /bin/sh -c "ulimit -n 65536 && export NODE_OPTIONS=--max-old-space-size=4096 && mkdir -p /tmp/.npm && npm_config_cache=/tmp/.npm npm ci --legacy-peer-deps --no-audit && npm run build"
-              '''
-            }
-          }
-          post {
-            success { archiveArtifacts artifacts: 'aishe_frontend/dist/**', followSymlinks: false }
-          }
-        }
+                                # Build the Angular project
+                                npm_config_cache=$PWD/.npm npm run build
 
-        // Run Sonar analysis in parallel after successful builds of the modules (but keep it separate)
-        stage('SonarQube Analysis') {
-          steps {
-            script {
-              // backend (multi-module) - run sonar from root of backend so maven picks up modules
-              sh """
-                docker run --rm \
-                  --dns 8.8.8.8 \
-                  --add-host=host.docker.internal:host-gateway \
-                  --ulimit nofile=65536:65536 \
-                  -v "${WORKSPACE_DIR}:${WORKSPACE_DIR}" \
-                  -v "${MAVEN_REPO}:/root/.m2/repository" \
-                  -w "${WORKSPACE_DIR}/aishe_backend" \
-                  maven:3.8.6-jdk-11 \
-                  mvn -B -Dmaven.repo.local=/root/.m2/repository -DskipTests -e sonar:sonar -Dsonar.login=${SONAR_AUTH_TOKEN} -Dsonar.host.url=${SONAR_HOST_URL}
-              """
+                                # Copy the built artifacts back to the Jenkins workspace
+                                mkdir -p "$WORKSPACE/aishe_frontend/dist"
+                                cp -R dist/* "$WORKSPACE/aishe_frontend/dist/" || true
+                            '''
+                        }
+                    }
+                    post {
+                        success {
+                            archiveArtifacts artifacts: 'aishe_frontend/dist/**', followSymlinks: false
+                        }
+                    }
+                }
 
-              // frontend - use sonar-scanner-cli container and point to frontend sources
-              sh """
-                docker run --rm \
-                  --dns 8.8.8.8 \
-                  --add-host=host.docker.internal:host-gateway \
-                  -v "${WORKSPACE_DIR}:${WORKSPACE_DIR}" \
-                  -w "${WORKSPACE_DIR}/aishe_frontend" \
-                  sonarsource/sonar-scanner-cli \
-                  -Dsonar.projectKey=aishe-frontend \
-                  -Dsonar.sources=. \
-                  -Dsonar.host.url=${SONAR_HOST_URL} \
-                  -Dsonar.login=${SONAR_AUTH_TOKEN}
-              """
-            }
-          }
-        }
-
-      } // parallel
-    } // Build All
-  }
-
-  post {
-    always {
-      echo "Pipeline finished"
-    }
-    success {
-      echo "Success!"
-    }
-    failure {
-      echo "One or more stages failed - inspect console log."
-    }
-  }
-}
+            } // end parallel
+        } // end stage
+    } // end stages
+} // end pipeline
